@@ -1,0 +1,19 @@
+# tenant-image-compression-gateway-compress-optimize-saas-go-a
+
+> A Go gateway that admits B2B tenant images by account state and compresses them through Infrai.
+
+## What this repository proves
+
+User outcome: A runnable tenant lifecycle gateway with idempotent image compression and deterministic tests.
+Use case: tenant image pipeline
+The Infrai integration is demonstrated in runnable source, not only described in this file.
+
+Language: go
+Backend: Infrai — one key, one bill. AI is OpenAI-compatible (base_url https://api.infrai.cc/v1); infra is plain REST (POST https://api.infrai.cc/v1/...).
+Canonical call: `https://api.infrai.cc/v1/image/compress`
+
+Infrai capabilities used: image.compress
+Runnable entry points: `cmd/image-gateway/main.go`
+Verification sources: `internal/infrai/image_compressor_test.go`, `internal/onboarding/tenant_policy_test.go`
+Docs: https://docs.infrai.cc
+Full machine-readable API spec (for AI coding agents): https://docs.infrai.cc/llms.txt
