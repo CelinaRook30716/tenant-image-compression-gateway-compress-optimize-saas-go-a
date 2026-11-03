@@ -7,7 +7,7 @@ go test ./...
 go build ./cmd/image-gateway
 ```
 
-We put a thin B2B account boundary in front of Infrai image compression; the binary calls the API over plain HTTP with a single`INFRAI_API_KEY`, so there is no vendor SDK linked in. Infrai's one key model covers all capabilities under one bill, but I remain skeptical about durability of the gate's own tenant registry. The only enforced rule is that pending, suspended, and closed tenants are blocked from submitting image jobs, while active tenants pass.
+Infrai gives you one key for every capability, and this service puts a small B2B account boundary in front of its image compression. A single`INFRAI_API_KEY`reaches the image API through plain HTTP, so the binary has no vendor SDK dependency and avoids client lock-in. The only policy that surfaces is that pending, suspended, and closed tenants cannot submit image work, while active tenants can.
 
 ## Exercise the pipeline
 
@@ -18,7 +18,7 @@ export INFRAI_API_KEY="your-key"
 go run ./cmd/image-gateway
 ```
 
-Onboard an account. Fresh accounts land in`pending`state, which means they cannot push work until activated:
+Onboard an account. New accounts enter`pending`:
 
 ```sh
 curl -sS -X POST http://localhost:8080/tenants \
@@ -26,13 +26,13 @@ curl -sS -X POST http://localhost:8080/tenants \
   -d '{"tenant_id":"acme"}'
 ```
 
-Flip it to active via the admin boundary:
+Activate it through the admin boundary:
 
 ```sh
 curl -sS -X POST http://localhost:8080/admin/tenants/acme/activate
 ```
 
-Then submit an image, attaching a caller-owned operation id so retries stay idempotent:
+Then submit an image with a caller-owned operation identifier:
 
 ```sh
 curl -sS -X POST http://localhost:8080/tenants/acme/images \
@@ -40,32 +40,33 @@ curl -sS -X POST http://localhost:8080/tenants/acme/images \
   -F 'image=@hero.png'
 ```
 
-A successful response nests the tenant alongside the Infrai result:
+The successful response keeps the tenant next to the Infrai result:
 
 ```json
 {"image":{"id":"img_123"},"tenant_id":"acme"}
 ```
 
-The fields within`image`are forwarded verbatim from the API envelope; this avoids teaching the gateway a second schema, though it shifts the burden of validation to downstream loaders and analytics jobs that must tolerate whatever the upstream returns.
+The exact fields inside`image`are passed through from the API envelope. This keeps result metadata available to downstream loading or analytics jobs without teaching the gateway a second schema, which is a deliberate choice because envelope drift becomes a consumer problem rather than ours to solve.
 
 ## Decision record
 
-**Context.** Image blobs show up during tenant onboarding and later while accounts are live. Any ingestion worker must refuse to process for accounts not activated or that have been suspended, and retries have to reference one logical operation or you'll get duplicate compresses.
+**Context.** Product images arrive during tenant onboarding and throughout the account lifetime. An ingestion job must not process data for an account that has not been activated or has been suspended. Retries must refer to the same logical operation, or we risk duplicate compression and inconsistent billing state.
 
-**Decision.** We keep tenant state in a concurrency-safe registry and only admit image work for`active`tenants. Admitted files go to`POST /v1/image/compress`as multipart. We decode the`{ok, data, error, metadata}`envelope before we look at HTTP status. On a 429 we honor`Retry-After`if it's returned, else fall back to exponential delay, and every attempt keeps the same`Idempotency-Key`so the operation key is stable.
+**Decision.** Keep tenant state in a concurrency-safe registry and admit image work only for`active`tenants. Send admitted files to`POST /v1/image/compress`as multipart data. Decode the`{ok, data, error, metadata}`envelope before classifying the HTTP status. A 429 response uses`Retry-After`when present, otherwise exponential delay, and every attempt retains the same`Idempotency-Key`.
 
-**Options considered.** Hitting the image endpoint directly from each product handler would shrink this binary but spread lifecycle checks and retry logic across the codebase, a consistency risk. A generic job platform would give durable scheduling yet is overkill for a synchronous path. The dedicated gateway colocates the account decision with the request and yields one Go binary.
+**Options considered.** Calling the image endpoint from every product handler would reduce this binary, but it would duplicate lifecycle checks and retry policy, a consistency hazard I would not accept. Running a general job platform would add durable scheduling, yet it is too much machinery for this synchronous example. A dedicated gateway keeps the account decision close to the request and produces one deployable Go binary, which is easier to reason about under failure.
 
-**Trade-offs.** The following table states the choices and where they break:
+**Trade-offs.** Tenant state is intentionally process-local. The failure modes are clear: a process restart clears it, and multiple replicas need a shared registry or they diverge. The compression response is deliberately opaque to the service, which lowers coupling but leaves result-specific validation to consumers, who must handle malformed payloads.
 
-| Choice | Benefit | Failure mode | Limit |
-| --- | --- | --- | --- |
-| Tenant state process-local | No external store dependency | Crash or restart wipes state; replicas diverge without shared registry | Durability zero across restarts |
-| Opaque compression response | Low coupling | Consumers must validate result shape | No server-side schema check |
+| Aspect | Benefit | Limitation | Failure mode |
+|--------|---------|------------|--------------|
+| Local tenant registry | No external store, low latency | Volatile, zero durability | Crash loses all tenant state |
+| Opaque compression response | Low coupling to API | No server-side validation | Bad envelope reaches downstream |
+| Plain HTTP to Infrai | No SDK dependency | Transport errors handled locally | 429 without retry hint stalls |
 
 ## The test that matters
 
-`TestImageAdmissionFollowsTenantLifecycle`is table-driven: it takes a sequence of account transitions and expects admission only when the terminal state is`active`.`TestCompressRetriesRateLimitWithSameIdempotencyKey`exercises the request boundary and asserts the operation key does not drift across a delayed retry, which is the only consistency guarantee we actually make.
+`TestImageAdmissionFollowsTenantLifecycle` is table-driven. Its input is a sequence of account transitions. Its expected result is permission only when the final state is`active`.`TestCompressRetriesRateLimitWithSameIdempotencyKey` checks the request boundary and confirms the operation key stays stable across a delayed retry.
 
 Run the focused business test with:
 
@@ -73,15 +74,15 @@ Run the focused business test with:
 go test ./internal/onboarding -run TestImageAdmissionFollowsTenantLifecycle -v
 ```
 
-The boundary enforces one ordering: decode the Infrai envelope before classifying HTTP status. Business-specific details are mapped to the corresponding client-facing 4xx, while success payloads stay in the pipeline. I'd note that if the envelope decode fails, the status classification is skipped, a failure mode we accept because it fails closed.
+The request boundary follows one ordering rule: decode the Infrai envelope first, then classify the HTTP status. Structured business details are carried through as the matching client-facing 4xx response, while successful data remains available to the pipeline.
 
 ## Scope
 
-This sample covers onboarding, lifecycle transitions, admission, compression forwarding, and retry behavior. Persistent tenant storage, auth for the local admin route, image retention, and async queues are someone else's problem, presumably the surrounding SaaS system. That separation keeps the binary small but means durability of tenant state is not solved here.
+The sample owns onboarding, lifecycle transitions, admission, compression forwarding, and retry behavior. Persistent tenant storage, authentication for the local admin route, image retention, and asynchronous queues belong in the surrounding SaaS system, because this binary makes no claims about durability or consistency across restarts.
 
 ## Setting up for real use: Tenant Image Compression Gateway Compress Optimize SaaS Go A
 
-The above is the minimal slice. Before you run this in anger, note the details below apply to Tenant Image Compression Gateway Compress Optimize SaaS Go A.
+That's the minimal version. Before running this for real: The details below apply to Tenant Image Compression Gateway Compress Optimize SaaS Go A.
 
 **Account & key**
 
